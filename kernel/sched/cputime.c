@@ -4,6 +4,20 @@
  */
 #include <linux/cpufreq_times.h>
 #include "sched.h"
+#include "walt/walt.h"
+
+#ifdef OPLUS_FEATURE_TASK_CPUSTATS
+#ifdef  CONFIG_OPLUS_CTP
+#include <linux/task_cpustats.h>
+#endif
+#ifdef CONFIG_OPLUS_SCHED
+#include <linux/task_sched_info.h>
+#endif
+#endif /* OPLUS_FEATURE_TASK_CPUSTATS */
+
+#if IS_ENABLED(CONFIG_OPLUS_FEATURE_CPU_JANKINFO)
+#include <linux/cpu_jankinfo/jank_cpuload.h>
+#endif
 
 #ifdef CONFIG_IRQ_TIME_ACCOUNTING
 
@@ -71,6 +85,16 @@ void irqtime_account_irq(struct task_struct *curr)
 		irqtime_account_delta(irqtime, delta, CPUTIME_IRQ);
 	else if (in_serving_softirq() && curr != this_cpu_ksoftirqd())
 		irqtime_account_delta(irqtime, delta, CPUTIME_SOFTIRQ);
+
+#ifdef CONFIG_SCHED_WALT
+	if (is_idle_task(curr)) {
+		if (hardirq_count() || in_serving_softirq())
+			walt_sched_account_irqend(cpu, curr, delta);
+		else
+			walt_sched_account_irqstart(cpu, curr);
+	}
+	cpu_rq(cpu)->wrq.last_irq_window = cpu_rq(cpu)->wrq.window_start;
+#endif
 }
 EXPORT_SYMBOL_GPL(irqtime_account_irq);
 
@@ -151,10 +175,10 @@ void account_guest_time(struct task_struct *p, u64 cputime)
 
 	/* Add guest time to cpustat. */
 	if (task_nice(p) > 0) {
-		cpustat[CPUTIME_NICE] += cputime;
+		task_group_account_field(p, CPUTIME_NICE, cputime);
 		cpustat[CPUTIME_GUEST_NICE] += cputime;
 	} else {
-		cpustat[CPUTIME_USER] += cputime;
+		task_group_account_field(p, CPUTIME_USER, cputime);
 		cpustat[CPUTIME_GUEST] += cputime;
 	}
 }
@@ -386,15 +410,38 @@ static void irqtime_account_process_tick(struct task_struct *p, int user_tick,
 		 * Also, p->stime needs to be updated for ksoftirqd.
 		 */
 		account_system_index_time(p, cputime, CPUTIME_SOFTIRQ);
+#ifdef OPLUS_FEATURE_TASK_CPUSTATS
+#ifdef CONFIG_OPLUS_CTP
+		account_task_time(p, ticks, CPUTIME_SOFTIRQ);
+#endif
+#endif /* OPLUS_FEATURE_TASK_CPUSTATS */
 	} else if (user_tick) {
 		account_user_time(p, cputime);
+#ifdef OPLUS_FEATURE_TASK_CPUSTATS
+#ifdef CONFIG_OPLUS_CTP
+		account_task_time(p, ticks, CPUTIME_USER);
+#endif
+#endif /* OPLUS_FEATURE_TASK_CPUSTATS */
 	} else if (p == rq->idle) {
 		account_idle_time(cputime);
 	} else if (p->flags & PF_VCPU) { /* System time or guest time */
 		account_guest_time(p, cputime);
+#ifdef OPLUS_FEATURE_TASK_CPUSTATS
+#ifdef CONFIG_OPLUS_CTP
+		account_task_time(p, ticks, CPUTIME_USER);
+#endif
+#endif /* OPLUS_FEATURE_TASK_CPUSTATS */
 	} else {
 		account_system_index_time(p, cputime, CPUTIME_SYSTEM);
+#ifdef OPLUS_FEATURE_TASK_CPUSTATS
+#ifdef CONFIG_OPLUS_CTP
+		account_task_time(p, ticks, CPUTIME_SYSTEM);
+#endif
+#endif /* OPLUS_FEATURE_TASK_CPUSTATS */
 	}
+#if IS_ENABLED(CONFIG_OPLUS_FEATURE_CPU_JANKINFO)
+	jankinfo_update_time_info(rq, p, ticks*TICK_NSEC);
+#endif
 }
 
 static void irqtime_account_idle_ticks(int ticks)
@@ -484,6 +531,13 @@ void account_process_tick(struct task_struct *p, int user_tick)
 {
 	u64 cputime, steal;
 	struct rq *rq = this_rq();
+
+#if defined(OPLUS_FEATURE_TASK_CPUSTATS) && defined(CONFIG_OPLUS_SCHED)
+	if (ctp_send_message) {
+		sched_action_trig();
+		ctp_send_message = false;
+	}
+#endif /* defined(OPLUS_FEATURE_TASK_CPUSTATS) && defined(CONFIG_OPLUS_SCHED) */
 
 	if (vtime_accounting_cpu_enabled())
 		return;

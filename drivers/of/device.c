@@ -90,7 +90,7 @@ int of_dma_configure(struct device *dev, struct device_node *np, bool force_dma)
 {
 	u64 dma_addr, paddr, size = 0;
 	int ret;
-	bool coherent;
+	bool coherent, coherent_hint_cached;
 	unsigned long offset;
 	const struct iommu_ops *iommu;
 	u64 mask;
@@ -158,6 +158,13 @@ int of_dma_configure(struct device *dev, struct device_node *np, bool force_dma)
 	coherent = of_dma_is_coherent(np);
 	dev_dbg(dev, "device is%sdma coherent\n",
 		coherent ? " " : " not ");
+
+	coherent_hint_cached = of_dma_is_coherent_hint_cached(np);
+	dev_dbg(dev, "device is%sdma coherent_hint_cached\n",
+		coherent_hint_cached ? " " : " not ");
+	dma_set_coherent_hint_cached(dev, coherent_hint_cached);
+	WARN(coherent && coherent_hint_cached,
+	     "Should not set both dma-coherent and dma-coherent-hint-cached on the same device");
 
 	iommu = of_iommu_configure(dev, np);
 	if (IS_ERR(iommu) && PTR_ERR(iommu) == -EPROBE_DEFER)
@@ -246,12 +253,15 @@ int of_device_request_module(struct device *dev)
 	if (size < 0)
 		return size;
 
-	str = kmalloc(size + 1, GFP_KERNEL);
+	/* Reserve an additional byte for the trailing '\0' */
+	size++;
+
+	str = kmalloc(size, GFP_KERNEL);
 	if (!str)
 		return -ENOMEM;
 
 	of_device_get_modalias(dev, str, size);
-	str[size] = '\0';
+	str[size - 1] = '\0';
 	ret = request_module(str);
 	kfree(str);
 

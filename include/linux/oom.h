@@ -49,6 +49,9 @@ struct oom_control {
 	unsigned long totalpages;
 	struct task_struct *chosen;
 	long chosen_points;
+#ifdef CONFIG_PRIORITIZE_OOM_TASKS
+	short min_kill_adj;
+#endif
 
 	/* Used to print the constraint info. */
 	enum oom_constraint constraint;
@@ -108,7 +111,7 @@ static inline vm_fault_t check_stable_address_space(struct mm_struct *mm)
 
 bool __oom_reap_task_mm(struct mm_struct *mm);
 
-long oom_badness(struct task_struct *p,
+extern unsigned long oom_badness(struct task_struct *p,
 		unsigned long totalpages);
 
 extern bool out_of_memory(struct oom_control *oc);
@@ -127,4 +130,11 @@ extern struct task_struct *find_lock_task_mm(struct task_struct *p);
 extern int sysctl_oom_dump_tasks;
 extern int sysctl_oom_kill_allocating_task;
 extern int sysctl_panic_on_oom;
+extern int sysctl_reap_mem_on_sigkill;
+
+/* calls for LMK reaper */
+extern void add_to_oom_reaper(struct task_struct *p);
+extern void check_panic_on_foreground_kill(struct task_struct *p);
+#define ULMK_MAGIC "lmkd"
+#define ATHENA_KILLER_MAGIC "athena_killer"
 #endif /* _INCLUDE_LINUX_OOM_H */

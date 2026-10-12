@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-/* Copyright (c) 2018, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2018-2019, The Linux Foundation. All rights reserved.
  *
  * Inspired by dwc3-of-simple.c
  */
@@ -17,6 +17,7 @@
 #include <linux/platform_device.h>
 #include <linux/phy/phy.h>
 #include <linux/usb/of.h>
+#include <linux/regulator/consumer.h>
 #include <linux/reset.h>
 #include <linux/iopoll.h>
 
@@ -60,6 +61,7 @@ struct dwc3_qcom {
 	struct clk		**clks;
 	int			num_clocks;
 	struct reset_control	*resets;
+	struct regulator	*gdsc;
 
 	int			hs_phy_irq;
 	int			dp_hs_phy_irq;
@@ -102,7 +104,7 @@ static inline void dwc3_qcom_clrbits(void __iomem *base, u32 offset, u32 val)
 	readl(base + offset);
 }
 
-static void dwc3_qcom_vbus_overrride_enable(struct dwc3_qcom *qcom, bool enable)
+static void dwc3_qcom_vbus_override_enable(struct dwc3_qcom *qcom, bool enable)
 {
 	if (enable) {
 		dwc3_qcom_setbits(qcom->qscratch_base, QSCRATCH_SS_PHY_CTRL,
@@ -123,7 +125,7 @@ static int dwc3_qcom_vbus_notifier(struct notifier_block *nb,
 	struct dwc3_qcom *qcom = container_of(nb, struct dwc3_qcom, vbus_nb);
 
 	/* enable vbus override for device mode */
-	dwc3_qcom_vbus_overrride_enable(qcom, event);
+	dwc3_qcom_vbus_override_enable(qcom, event);
 	qcom->mode = event ? USB_DR_MODE_PERIPHERAL : USB_DR_MODE_HOST;
 
 	return NOTIFY_DONE;
@@ -135,7 +137,7 @@ static int dwc3_qcom_host_notifier(struct notifier_block *nb,
 	struct dwc3_qcom *qcom = container_of(nb, struct dwc3_qcom, host_nb);
 
 	/* disable vbus override in host mode */
-	dwc3_qcom_vbus_overrride_enable(qcom, !event);
+	dwc3_qcom_vbus_override_enable(qcom, !event);
 	qcom->mode = event ? USB_DR_MODE_HOST : USB_DR_MODE_PERIPHERAL;
 
 	return NOTIFY_DONE;
@@ -188,6 +190,14 @@ static int dwc3_qcom_register_extcon(struct dwc3_qcom *qcom)
 		dwc3_qcom_vbus_notifier(&qcom->vbus_nb, false, qcom->edev);
 
 	return 0;
+}
+
+/* Only usable in contexts where the role can not change. */
+static bool dwc3_qcom_is_host(struct dwc3_qcom *qcom)
+{
+	struct dwc3 *dwc = platform_get_drvdata(qcom->dwc3);
+
+	return dwc->xhci;
 }
 
 static void dwc3_qcom_disable_interrupts(struct dwc3_qcom *qcom)
@@ -297,7 +307,11 @@ static irqreturn_t qcom_dwc3_resume_irq(int irq, void *data)
 	if (qcom->pm_suspended)
 		return IRQ_HANDLED;
 
-	if (dwc->xhci)
+	/*
+	 * This is safe as role switching is done from a freezable workqueue
+	 * and the wakeup interrupts are disabled as part of resume.
+	 */
+	if (dwc3_qcom_is_host(qcom))
 		pm_runtime_resume(&dwc->xhci->dev);
 
 	return IRQ_HANDLED;
@@ -407,7 +421,7 @@ static int dwc3_qcom_clk_init(struct dwc3_qcom *qcom, int count)
 {
 	struct device		*dev = qcom->dev;
 	struct device_node	*np = dev->of_node;
-	int			i;
+	int			i, ret;
 
 	if (!np || !count)
 		return 0;
@@ -422,9 +436,23 @@ static int dwc3_qcom_clk_init(struct dwc3_qcom *qcom, int count)
 	if (!qcom->clks)
 		return -ENOMEM;
 
+	qcom->gdsc = devm_regulator_get(qcom->dev, "USB3_GDSC");
+	if (IS_ERR(qcom->gdsc)) {
+		if (PTR_ERR(qcom->gdsc) == -EPROBE_DEFER)
+			return PTR_ERR(qcom->gdsc);
+		qcom->gdsc = NULL;
+	}
+
+	if (qcom->gdsc) {
+		ret = regulator_enable(qcom->gdsc);
+		if (ret) {
+			dev_err(qcom->dev, "unable to enable usb3 gdsc\n");
+			return ret;
+		}
+	}
+
 	for (i = 0; i < qcom->num_clocks; i++) {
 		struct clk	*clk;
-		int		ret;
 
 		clk = of_clk_get(np, i);
 		if (IS_ERR(clk)) {
@@ -440,6 +468,14 @@ static int dwc3_qcom_clk_init(struct dwc3_qcom *qcom, int count)
 				clk_put(qcom->clks[i]);
 			}
 			clk_put(clk);
+
+			if (qcom->gdsc) {
+				ret = regulator_disable(qcom->gdsc);
+				if (ret) {
+					dev_err(qcom->dev, "unable to disable usb3 gdsc\n");
+					return ret;
+				}
+			}
 
 			return ret;
 		}
@@ -546,6 +582,7 @@ node_put:
 	return ret;
 }
 
+#ifdef CONFIG_ACPI
 static const struct dwc3_acpi_pdata sdm845_acpi_pdata = {
 	.qscratch_base_offset = SDM845_QSCRATCH_BASE_OFFSET,
 	.qscratch_base_size = SDM845_QSCRATCH_SIZE,
@@ -555,6 +592,7 @@ static const struct dwc3_acpi_pdata sdm845_acpi_pdata = {
 	.dm_hs_phy_irq_index = 3,
 	.ss_phy_irq_index = 2
 };
+#endif
 
 static int dwc3_qcom_probe(struct platform_device *pdev)
 {
@@ -562,6 +600,7 @@ static int dwc3_qcom_probe(struct platform_device *pdev)
 	struct device		*dev = &pdev->dev;
 	struct dwc3_qcom	*qcom;
 	struct resource		*res, *parent_res = NULL;
+	struct resource		local_res;
 	int			ret, i;
 	bool			ignore_pipe_clk;
 
@@ -612,9 +651,8 @@ static int dwc3_qcom_probe(struct platform_device *pdev)
 	if (np) {
 		parent_res = res;
 	} else {
-		parent_res = kmemdup(res, sizeof(struct resource), GFP_KERNEL);
-		if (!parent_res)
-			return -ENOMEM;
+		memcpy(&local_res, res, sizeof(struct resource));
+		parent_res = &local_res;
 
 		parent_res->start = res->start +
 			qcom->acpi_pdata->qscratch_base_offset;
@@ -657,8 +695,8 @@ static int dwc3_qcom_probe(struct platform_device *pdev)
 	qcom->mode = usb_get_dr_mode(&qcom->dwc3->dev);
 
 	/* enable vbus override for device mode */
-	if (qcom->mode == USB_DR_MODE_PERIPHERAL)
-		dwc3_qcom_vbus_overrride_enable(qcom, true);
+	if (qcom->mode != USB_DR_MODE_HOST)
+		dwc3_qcom_vbus_override_enable(qcom, true);
 
 	/* register extcon to override sw_vbus on Vbus change later */
 	ret = dwc3_qcom_register_extcon(qcom);
@@ -683,6 +721,9 @@ clk_disable:
 		clk_disable_unprepare(qcom->clks[i]);
 		clk_put(qcom->clks[i]);
 	}
+	if (qcom->gdsc)
+		if (regulator_disable(qcom->gdsc))
+			dev_err(qcom->dev, "unable to disable usb3 gdsc\n");
 reset_assert:
 	reset_control_assert(qcom->resets);
 
@@ -692,10 +733,14 @@ reset_assert:
 static int dwc3_qcom_remove(struct platform_device *pdev)
 {
 	struct dwc3_qcom *qcom = platform_get_drvdata(pdev);
+	struct device_node *np = pdev->dev.of_node;
 	struct device *dev = &pdev->dev;
 	int i;
 
-	of_platform_depopulate(dev);
+	if (np)
+		of_platform_depopulate(&pdev->dev);
+	else
+		platform_device_put(pdev);
 
 	for (i = qcom->num_clocks - 1; i >= 0; i--) {
 		clk_disable_unprepare(qcom->clks[i]);
@@ -764,11 +809,13 @@ static const struct of_device_id dwc3_qcom_of_match[] = {
 };
 MODULE_DEVICE_TABLE(of, dwc3_qcom_of_match);
 
+#ifdef CONFIG_ACPI
 static const struct acpi_device_id dwc3_qcom_acpi_match[] = {
 	{ "QCOM2430", (unsigned long)&sdm845_acpi_pdata },
 	{ },
 };
 MODULE_DEVICE_TABLE(acpi, dwc3_qcom_acpi_match);
+#endif
 
 static struct platform_driver dwc3_qcom_driver = {
 	.probe		= dwc3_qcom_probe,
@@ -777,7 +824,9 @@ static struct platform_driver dwc3_qcom_driver = {
 		.name	= "dwc3-qcom",
 		.pm	= &dwc3_qcom_dev_pm_ops,
 		.of_match_table	= dwc3_qcom_of_match,
+#ifdef CONFIG_ACPI
 		.acpi_match_table = ACPI_PTR(dwc3_qcom_acpi_match),
+#endif
 	},
 };
 

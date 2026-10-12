@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (C) 2013-2017 ARM Limited, All Rights Reserved.
+ * Copyright (C) 2020 Oplus. All rights reserved.
  * Author: Marc Zyngier <marc.zyngier@arm.com>
  */
 
@@ -18,6 +19,8 @@
 #include <linux/percpu.h>
 #include <linux/refcount.h>
 #include <linux/slab.h>
+#include <linux/suspend.h>
+#include <linux/msm_rtb.h>
 #include <linux/wakeup_reason.h>
 
 
@@ -31,7 +34,20 @@
 #include <asm/smp_plat.h>
 #include <asm/virt.h>
 
+#include <linux/syscore_ops.h>
+
 #include "irq-gic-common.h"
+#if defined(OPLUS_FEATURE_POWERINFO_STANDBY) && defined(CONFIG_OPLUS_WAKELOCK_PROFILER)
+#include "../../drivers/soc/oplus/oplus_wakelock/oplus_wakelock_profiler_qcom.h"
+#endif
+
+#if IS_ENABLED(CONFIG_OPLUS_FEATURE_NWPOWER)
+void (*match_modem_wakeup)(void) = NULL;
+EXPORT_SYMBOL(match_modem_wakeup);
+void (*match_wlan_wakeup)(void) = NULL;
+EXPORT_SYMBOL(match_wlan_wakeup);
+extern is_first_ipcc_msg;
+#endif /* CONFIG_OPLUS_FEATURE_NWPOWER */
 
 #define GICD_INT_NMI_PRI	(GICD_INT_DEF_PRI & ~0x80)
 
@@ -164,11 +180,11 @@ static inline void __iomem *gic_dist_base(struct irq_data *d)
 	}
 }
 
-static void gic_do_wait_for_rwp(void __iomem *base)
+static void gic_do_wait_for_rwp(void __iomem *base, u32 bit)
 {
 	u32 count = 1000000;	/* 1s! */
 
-	while (readl_relaxed(base + GICD_CTLR) & GICD_CTLR_RWP) {
+	while (readl_relaxed(base + GICD_CTLR) & bit) {
 		count--;
 		if (!count) {
 			pr_err_ratelimited("RWP timeout, gone fishing\n");
@@ -182,13 +198,13 @@ static void gic_do_wait_for_rwp(void __iomem *base)
 /* Wait for completion of a distributor change */
 static void gic_dist_wait_for_rwp(void)
 {
-	gic_do_wait_for_rwp(gic_data.dist_base);
+	gic_do_wait_for_rwp(gic_data.dist_base, GICD_CTLR_RWP);
 }
 
 /* Wait for completion of a redistributor change */
 static void gic_redist_wait_for_rwp(void)
 {
-	gic_do_wait_for_rwp(gic_data_rdist_rd_base());
+	gic_do_wait_for_rwp(gic_data_rdist_rd_base(), GICR_CTLR_RWP);
 }
 
 #ifdef CONFIG_ARM64
@@ -571,6 +587,131 @@ static int gic_irq_set_vcpu_affinity(struct irq_data *d, void *vcpu)
 	return 0;
 }
 
+#ifdef CONFIG_PM
+
+static int gic_suspend(void)
+{
+	return 0;
+}
+
+#if defined(OPLUS_FEATURE_POWERINFO_STANDBY) && defined(CONFIG_OPLUS_WAKELOCK_PROFILER)
+static bool wlan_resume_flag = false;
+bool get_wlan_touch_flag(void)
+{
+	return wlan_resume_flag;
+}
+EXPORT_SYMBOL(get_wlan_touch_flag);
+void set_wlan_touch_flag(void)
+{
+	wlan_resume_flag = true;
+}
+EXPORT_SYMBOL(set_wlan_touch_flag);
+void clear_wlan_touch_flag(void)
+{
+	wlan_resume_flag = false;
+}
+EXPORT_SYMBOL(clear_wlan_touch_flag);
+void wlan_resume_inc(void)
+{
+	wakeup_reasons_statics("wlan_", WS_CNT_WLAN);
+}
+EXPORT_SYMBOL(wlan_resume_inc);
+#endif
+static void gic_show_resume_irq(struct gic_chip_data *gic)
+{
+	unsigned int i;
+	u32 enabled;
+	u32 pending[32];
+	void __iomem *base = gic_data.dist_base;
+
+	if (!msm_show_resume_irq_mask)
+		return;
+	#if defined(OPLUS_FEATURE_POWERINFO_STANDBY) && defined(CONFIG_OPLUS_WAKELOCK_PROFILER)
+	wakeup_reasons_statics(IRQ_NAME_WAKE_SUM, WS_CNT_SUM);
+	set_wlan_touch_flag();
+	#endif
+	for (i = 0; i * 32 < GIC_LINE_NR; i++) {
+		enabled = readl_relaxed(base + GICD_ICENABLER + i * 4);
+		pending[i] = readl_relaxed(base + GICD_ISPENDR + i * 4);
+		pending[i] &= enabled;
+	}
+
+	for (i = find_first_bit((unsigned long *)pending, GIC_LINE_NR);
+	     i < GIC_LINE_NR;
+	     i = find_next_bit((unsigned long *)pending, GIC_LINE_NR, i + 1)) {
+		unsigned int irq = irq_find_mapping(gic->domain, i);
+		struct irq_desc *desc = irq_to_desc(irq);
+		const char *name = "null";
+
+		if (i < 32)
+			continue;
+
+		if (desc == NULL)
+			name = "stray irq";
+		else if (desc->action && desc->action->name)
+			name = desc->action->name;
+		else if (desc->irq_data.chip && desc->irq_data.chip->name)
+			name = desc->irq_data.chip->name;
+
+		#if defined(OPLUS_FEATURE_POWERINFO_STANDBY) && defined(CONFIG_OPLUS_WAKELOCK_PROFILER)
+		if ((name != NULL)&&(strncmp(name, "ipa", strlen("ipa")) != 0))
+			log_irq_wakeup_reason(irq);
+		#endif
+
+		pr_warn("%s: irq:%d hwirq:%u triggered %s\n",
+			 __func__, irq, i, name);
+		#if IS_ENABLED(CONFIG_OPLUS_FEATURE_NWPOWER)
+		if (strncmp(name, "ipcc_0", strlen("ipcc_0")) == 0) {
+			is_first_ipcc_msg = 1;
+			if (match_modem_wakeup != NULL) {
+				match_modem_wakeup();
+			}
+		} else if (strncmp(name, "wlan_wake_irq", strlen("wlan_wake_irq")) == 0) {
+			if (match_wlan_wakeup != NULL) {
+				match_wlan_wakeup();
+			}
+		}
+		#endif /* CONFIG_OPLUS_FEATURE_NWPOWER */
+		#if defined(OPLUS_FEATURE_POWERINFO_STANDBY) && defined(CONFIG_OPLUS_WAKELOCK_PROFILER)
+		#if IS_ENABLED(CONFIG_OPLUS_FEATURE_NWPOWER)
+		do {
+			if (strncmp(name, "ipa", strlen("ipa")) != 0) {
+				wakeup_reasons_statics(name, WS_CNT_MODEM|WS_CNT_WLAN|WS_CNT_ADSP|WS_CNT_CDSP|WS_CNT_SLPI);
+			}
+		} while (0);
+		#else
+		do {
+			wakeup_reasons_statics(name, WS_CNT_MODEM|WS_CNT_WLAN|WS_CNT_ADSP|WS_CNT_CDSP|WS_CNT_SLPI);
+		} while(0);
+		#endif /* CONFIG_OPLUS_FEATURE_NWPOWER */
+		#endif
+	}
+}
+
+static void gic_resume_one(struct gic_chip_data *gic)
+{
+	gic_show_resume_irq(gic);
+}
+
+static void gic_resume(void)
+{
+	gic_resume_one(&gic_data);
+}
+
+static struct syscore_ops gic_syscore_ops = {
+	.suspend = gic_suspend,
+	.resume = gic_resume,
+};
+
+static int __init gic_init_sys(void)
+{
+	register_syscore_ops(&gic_syscore_ops);
+	return 0;
+}
+arch_initcall(gic_init_sys);
+
+#endif
+
 static u64 gic_mpidr_to_affinity(unsigned long mpidr)
 {
 	u64 aff;
@@ -642,6 +783,7 @@ static asmlinkage void __exception_irq_entry gic_handle_irq(struct pt_regs *regs
 	if (likely(irqnr > 15)) {
 		int err;
 
+		uncached_logk(LOGK_IRQ, (void *)(uintptr_t)irqnr);
 		if (static_branch_likely(&supports_deactivate_key))
 			gic_write_eoir(irqnr);
 		else
@@ -658,6 +800,7 @@ static asmlinkage void __exception_irq_entry gic_handle_irq(struct pt_regs *regs
 		return;
 	}
 	if (irqnr < 16) {
+		uncached_logk(LOGK_IRQ, (void *)(uintptr_t)irqnr);
 		gic_write_eoir(irqnr);
 		if (static_branch_likely(&supports_deactivate_key))
 			gic_write_dir(irqnr);
@@ -827,10 +970,6 @@ static int __gic_populate_rdist(struct redist_region *region, void __iomem *ptr)
 		gic_data_rdist_rd_base() = ptr;
 		gic_data_rdist()->phys_base = region->phys_base + offset;
 
-		pr_info("CPU%d: found redistributor %lx region %d:%pa\n",
-			smp_processor_id(), mpidr,
-			(int)(region - gic_data.redist_regions),
-			&gic_data_rdist()->phys_base);
 		return 0;
 	}
 
@@ -1178,6 +1317,13 @@ static int gic_set_affinity(struct irq_data *d, const struct cpumask *mask_val,
 #define gic_set_affinity	NULL
 #define gic_smp_init()		do { } while(0)
 #endif
+
+#ifdef CONFIG_QGKI_SHOW_S2IDLE_WAKE_IRQ
+void gic_s2idle_wake(void)
+{
+	gic_resume_one(&gic_data);
+}
+#endif /* CONFIG_QGKI_SHOW_S2IDLE_WAKE_IRQ */
 
 #ifdef CONFIG_CPU_PM
 static int gic_cpu_pm_notifier(struct notifier_block *self,
@@ -1621,7 +1767,7 @@ static void __init gic_populate_ppi_partitions(struct device_node *gic_node)
 
 	gic_data.ppi_descs = kcalloc(gic_data.ppi_nr, sizeof(*gic_data.ppi_descs), GFP_KERNEL);
 	if (!gic_data.ppi_descs)
-		return;
+		goto out_put_node;
 
 	nr_parts = of_get_child_count(parts_node);
 
@@ -1662,12 +1808,15 @@ static void __init gic_populate_ppi_partitions(struct device_node *gic_node)
 				continue;
 
 			cpu = of_cpu_node_to_id(cpu_node);
-			if (WARN_ON(cpu < 0))
+			if (WARN_ON(cpu < 0)) {
+				of_node_put(cpu_node);
 				continue;
+			}
 
 			pr_cont("%pOF[%d] ", cpu_node, cpu);
 
 			cpumask_set_cpu(cpu, &part->mask);
+			of_node_put(cpu_node);
 		}
 
 		pr_cont("}\n");

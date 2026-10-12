@@ -33,6 +33,7 @@
 #include <linux/interrupt.h>
 #include <linux/kernel.h>
 #include <linux/kmod.h>
+#include <linux/kthread.h>
 #include <linux/list.h>
 #include <linux/mempolicy.h>
 #include <linux/mm.h>
@@ -65,6 +66,12 @@
 #include <linux/mutex.h>
 #include <linux/cgroup.h>
 #include <linux/wait.h>
+
+#ifdef CONFIG_OPLUS_FEATURE_UID_PERF
+#include <linux/perf_event.h>
+#include <linux/module.h>
+#include "cgroup-internal.h"
+#endif
 
 DEFINE_STATIC_KEY_FALSE(cpusets_pre_enable_key);
 DEFINE_STATIC_KEY_FALSE(cpusets_enabled_key);
@@ -105,6 +112,7 @@ struct cpuset {
 
 	/* user-configured CPUs and Memory Nodes allow to tasks */
 	cpumask_var_t cpus_allowed;
+	cpumask_var_t cpus_requested;
 	nodemask_t mems_allowed;
 
 	/* effective CPUs and Memory Nodes allow to tasks */
@@ -432,7 +440,7 @@ static void cpuset_update_task_spread_flag(struct cpuset *cs,
 
 static int is_cpuset_subset(const struct cpuset *p, const struct cpuset *q)
 {
-	return	cpumask_subset(p->cpus_allowed, q->cpus_allowed) &&
+	return	cpumask_subset(p->cpus_requested, q->cpus_requested) &&
 		nodes_subset(p->mems_allowed, q->mems_allowed) &&
 		is_cpu_exclusive(p) <= is_cpu_exclusive(q) &&
 		is_mem_exclusive(p) <= is_mem_exclusive(q);
@@ -469,8 +477,13 @@ static inline int alloc_cpumasks(struct cpuset *cs, struct tmpmasks *tmp)
 	if (!zalloc_cpumask_var(pmask3, GFP_KERNEL))
 		goto free_two;
 
+	if (cs && !zalloc_cpumask_var(&cs->cpus_requested, GFP_KERNEL))
+		goto free_three;
+
 	return 0;
 
+free_three:
+	free_cpumask_var(*pmask3);
 free_two:
 	free_cpumask_var(*pmask2);
 free_one:
@@ -487,6 +500,7 @@ static inline void free_cpumasks(struct cpuset *cs, struct tmpmasks *tmp)
 {
 	if (cs) {
 		free_cpumask_var(cs->cpus_allowed);
+		free_cpumask_var(cs->cpus_requested);
 		free_cpumask_var(cs->effective_cpus);
 		free_cpumask_var(cs->subparts_cpus);
 	}
@@ -515,6 +529,7 @@ static struct cpuset *alloc_trial_cpuset(struct cpuset *cs)
 	}
 
 	cpumask_copy(trial->cpus_allowed, cs->cpus_allowed);
+	cpumask_copy(trial->cpus_requested, cs->cpus_requested);
 	cpumask_copy(trial->effective_cpus, cs->effective_cpus);
 	return trial;
 }
@@ -583,7 +598,7 @@ static int validate_change(struct cpuset *cur, struct cpuset *trial)
 	cpuset_for_each_child(c, css, par) {
 		if ((is_cpu_exclusive(trial) || is_cpu_exclusive(c)) &&
 		    c != cur &&
-		    cpumask_intersects(trial->cpus_allowed, c->cpus_allowed))
+		    cpumask_intersects(trial->cpus_requested, c->cpus_requested))
 			goto out;
 		if ((is_mem_exclusive(trial) || is_mem_exclusive(c)) &&
 		    c != cur &&
@@ -1034,6 +1049,22 @@ void rebuild_sched_domains(void)
 	put_online_cpus();
 }
 
+static int update_cpus_allowed(struct cpuset *cs, struct task_struct *p,
+			       const struct cpumask *new_mask)
+{
+#ifdef CONFIG_SCHED_WALT
+	int ret;
+
+	if (cpumask_subset(&p->wts.cpus_requested, cs->cpus_requested)) {
+		ret = set_cpus_allowed_ptr(p, &p->wts.cpus_requested);
+		if (!ret)
+			return ret;
+	}
+#endif
+
+	return set_cpus_allowed_ptr(p, new_mask);
+}
+
 /**
  * update_tasks_cpumask - Update the cpumasks of tasks in the cpuset.
  * @cs: the cpuset in which each task's cpus_allowed mask needs to be changed
@@ -1046,10 +1077,18 @@ static void update_tasks_cpumask(struct cpuset *cs)
 {
 	struct css_task_iter it;
 	struct task_struct *task;
+	bool top_cs = cs == &top_cpuset;
 
 	css_task_iter_start(&cs->css, 0, &it);
-	while ((task = css_task_iter_next(&it)))
-		set_cpus_allowed_ptr(task, cs->effective_cpus);
+	while ((task = css_task_iter_next(&it))) {
+		/*
+		 * Percpu kthreads in top_cpuset are ignored
+		 */
+		if (top_cs && (task->flags & PF_KTHREAD) &&
+		    kthread_is_per_cpu(task))
+			continue;
+		update_cpus_allowed(cs, task, cs->effective_cpus);
+	}
 	css_task_iter_end(&it);
 }
 
@@ -1070,10 +1109,10 @@ static void compute_effective_cpumask(struct cpumask *new_cpus,
 	if (parent->nr_subparts_cpus) {
 		cpumask_or(new_cpus, parent->effective_cpus,
 			   parent->subparts_cpus);
-		cpumask_and(new_cpus, new_cpus, cs->cpus_allowed);
+		cpumask_and(new_cpus, new_cpus, cs->cpus_requested);
 		cpumask_and(new_cpus, new_cpus, cpu_active_mask);
 	} else {
-		cpumask_and(new_cpus, cs->cpus_allowed, parent->effective_cpus);
+		cpumask_and(new_cpus, cs->cpus_requested, parent_cs(cs)->effective_cpus);
 	}
 }
 
@@ -1462,10 +1501,15 @@ static void update_sibling_cpumasks(struct cpuset *parent, struct cpuset *cs,
 	struct cpuset *sibling;
 	struct cgroup_subsys_state *pos_css;
 
+	percpu_rwsem_assert_held(&cpuset_rwsem);
+
 	/*
 	 * Check all its siblings and call update_cpumasks_hier()
 	 * if their use_parent_ecpus flag is set in order for them
 	 * to use the right effective_cpus value.
+	 *
+	 * The update_cpumasks_hier() function may sleep. So we have to
+	 * release the RCU read lock before calling it.
 	 */
 	rcu_read_lock();
 	cpuset_for_each_child(sibling, pos_css, parent) {
@@ -1473,8 +1517,13 @@ static void update_sibling_cpumasks(struct cpuset *parent, struct cpuset *cs,
 			continue;
 		if (!sibling->use_parent_ecpus)
 			continue;
+		if (!css_tryget_online(&sibling->css))
+			continue;
 
+		rcu_read_unlock();
 		update_cpumasks_hier(sibling, tmp);
+		rcu_read_lock();
+		css_put(&sibling->css);
 	}
 	rcu_read_unlock();
 }
@@ -1496,25 +1545,26 @@ static int update_cpumask(struct cpuset *cs, struct cpuset *trialcs,
 		return -EACCES;
 
 	/*
-	 * An empty cpus_allowed is ok only if the cpuset has no tasks.
+	 * An empty cpus_requested is ok only if the cpuset has no tasks.
 	 * Since cpulist_parse() fails on an empty mask, we special case
 	 * that parsing.  The validate_change() call ensures that cpusets
 	 * with tasks have cpus.
 	 */
 	if (!*buf) {
-		cpumask_clear(trialcs->cpus_allowed);
+		cpumask_clear(trialcs->cpus_requested);
 	} else {
-		retval = cpulist_parse(buf, trialcs->cpus_allowed);
+		retval = cpulist_parse(buf, trialcs->cpus_requested);
 		if (retval < 0)
 			return retval;
-
-		if (!cpumask_subset(trialcs->cpus_allowed,
-				    top_cpuset.cpus_allowed))
-			return -EINVAL;
 	}
 
+	if (!cpumask_subset(trialcs->cpus_requested, cpu_present_mask))
+		return -EINVAL;
+
+	cpumask_and(trialcs->cpus_allowed, trialcs->cpus_requested, cpu_active_mask);
+
 	/* Nothing to do if the cpus didn't change */
-	if (cpumask_equal(cs->cpus_allowed, trialcs->cpus_allowed))
+	if (cpumask_equal(cs->cpus_requested, trialcs->cpus_requested))
 		return 0;
 
 	retval = validate_change(cs, trialcs);
@@ -1542,13 +1592,13 @@ static int update_cpumask(struct cpuset *cs, struct cpuset *trialcs,
 
 	spin_lock_irq(&callback_lock);
 	cpumask_copy(cs->cpus_allowed, trialcs->cpus_allowed);
+	cpumask_copy(cs->cpus_requested, trialcs->cpus_requested);
 
 	/*
 	 * Make sure that subparts_cpus is a subset of cpus_allowed.
 	 */
 	if (cs->nr_subparts_cpus) {
-		cpumask_andnot(cs->subparts_cpus, cs->subparts_cpus,
-			       cs->cpus_allowed);
+		cpumask_and(cs->subparts_cpus, cs->subparts_cpus, cs->cpus_allowed);
 		cs->nr_subparts_cpus = cpumask_weight(cs->subparts_cpus);
 	}
 	spin_unlock_irq(&callback_lock);
@@ -1994,12 +2044,7 @@ static int update_prstate(struct cpuset *cs, int val)
 		update_flag(CS_CPU_EXCLUSIVE, cs, 0);
 	}
 
-	/*
-	 * Update cpumask of parent's tasks except when it is the top
-	 * cpuset as some system daemons cannot be mapped to other CPUs.
-	 */
-	if (parent != &top_cpuset)
-		update_tasks_cpumask(parent);
+	update_tasks_cpumask(parent);
 
 	if (parent->child_ecpus_count)
 		update_sibling_cpumasks(parent, cs, &tmp);
@@ -2111,6 +2156,306 @@ static int fmeter_getrate(struct fmeter *fmp)
 	return val;
 }
 
+#ifdef CONFIG_OPLUS_FEATURE_UID_PERF
+#define CG_HASH_BITS 3
+#define MAX_BOOL_LEN 2
+static struct proc_dir_entry *cpu_parent;
+
+static bool dbg_enable;
+
+DECLARE_HASHTABLE(cg_hash_table, CG_HASH_BITS);
+struct cg_entry {
+	int cgid;
+	char name[MAX_CGROUP_TYPE_NAMELEN];
+	struct hlist_node hash;
+};
+
+/*
+ * get the index of the cgroup by cgid
+ */
+static int get_cpuset_cgrp_idx(int cgid)
+{
+	struct cg_entry* cg;
+	unsigned long bkt;
+	int idx = 0;
+
+	hash_for_each(cg_hash_table, bkt, cg, hash) {
+		if (cg->cgid == cgid)
+			goto end;
+		idx++;
+	}
+	idx = -1;
+end:
+	if (dbg_enable)
+		pr_err("%s: cgrp_id=%d return idx=%d", __func__, cgid, idx);
+
+	return idx;
+}
+
+/*
+ * get the index of the cgroup by name
+ */
+int get_cpuset_cgrp_idx_by_name(const char *cg_name)
+{
+	struct cg_entry* cg;
+	unsigned long bkt;
+	int idx = 0;
+
+	hash_for_each(cg_hash_table, bkt, cg, hash) {
+		if (!strncmp(cg->name, cg_name, strlen(cg_name)))
+			goto end;
+		idx++;
+	}
+	idx = -1;
+end:
+	if (dbg_enable)
+		pr_err("%s: cgrp_name=%s return idx=%d", __func__, cg_name, idx);
+
+	return idx;
+}
+
+static int hash_show(struct seq_file *m, void *v)
+{
+	struct cg_entry* cg;
+        unsigned long bkt;
+	int i;
+
+        hash_for_each(cg_hash_table, bkt, cg, hash) {
+                seq_printf(m, "cgid=\"%d\",name=\"%s\",idx=\"%d\"\n", cg->cgid, cg->name, get_cpuset_cgrp_idx(cg->cgid));
+        }
+
+	seq_printf(m, "===========\n");
+
+	for(i = 2; i < 13; i++) {
+		seq_printf(m, "cgid = %d, idx = %d\n",i, get_cpuset_cgrp_idx(i));
+	}
+
+        return 0;
+}
+
+static int hashdump_open(struct inode *inode, struct file *file)
+{
+        return single_open(file, hash_show, NULL);
+}
+
+static const struct file_operations hashdump_fops = {
+        .open           = hashdump_open,
+        .read           = seq_read,
+        .llseek         = seq_lseek,
+        .release        = single_release,
+};
+
+static int dbg_show(struct seq_file *m, void *v)
+{
+        seq_printf(m, "%d\n", dbg_enable);
+        return 0;
+}
+
+static ssize_t dbg_proc_write(struct file *file, const char __user *buf,
+		size_t count, loff_t *ppos)
+{
+	char buffer[MAX_BOOL_LEN];
+	int err = 0;
+	int enable;
+
+	memset(buffer, 0, sizeof(buffer));
+
+	if (count > sizeof(buffer) - 1)
+		count = sizeof(buffer) - 1;
+
+	if (copy_from_user((void *)buffer, buf, count)) {
+		err = -EFAULT;
+		goto out;
+	}
+	err = kstrtoint(strstrip(buffer), 0, &enable);
+	if (err)
+		goto out;
+
+	dbg_enable = enable;
+out:
+	return err < 0 ? err : count;
+}
+
+static int dbg_proc_open(struct inode *inode, struct file *file)
+{
+        return single_open(file, dbg_show, NULL);
+}
+
+static const struct file_operations dbg_fops = {
+        .open           = dbg_proc_open,
+	.write		= dbg_proc_write,
+        .read           = seq_read,
+        .llseek         = seq_lseek,
+        .release        = single_release,
+};
+
+void cpuset_add_cg(int cgid, char* name)
+{
+	struct cg_entry* cg;
+
+	/* MUSTFIX: cgroup array of task_struct only has 8 buckets */
+	if (cgid > UID_GROUP_SIZE + 1)
+		return;
+
+        cg = kzalloc(sizeof(struct cg_entry), GFP_ATOMIC);
+        if (!cg)
+                return;
+
+        cg->cgid = cgid;
+	strncpy(cg->name, name, MAX_CGROUP_TYPE_NAMELEN);
+	hash_add(cg_hash_table, &cg->hash, cgid);
+}
+
+
+static void cpuset_calc_counter(struct task_struct *task)
+{
+	u64 enabled, running;
+	int i, src_idx = -1, dst_idx = -1;
+	struct css_set *cset;
+	char cg_src[MAX_CGROUP_TYPE_NAMELEN], cg_dst[MAX_CGROUP_TYPE_NAMELEN];
+	u64 val;
+
+	if (!get_uid_perf_enable())
+		return;
+
+	rcu_read_lock();
+	spin_lock_irq(&css_set_lock);
+
+	cset = task_css_set(task);
+	if (cset->mg_src_cgrp && cset->mg_dst_cgrp) {
+		cgroup_name(cset->mg_src_cgrp, cg_src, MAX_CGROUP_TYPE_NAMELEN);
+		cgroup_name(cset->mg_dst_cgrp, cg_dst, MAX_CGROUP_TYPE_NAMELEN);
+		if (dbg_enable)
+			pr_err("%s: src_cg = %s, id = %d, dst_cg = %s, id = %d, task = %s, pid=%d",
+				__func__, cg_src, cset->mg_src_cgrp->id, cg_dst, cset->mg_dst_cgrp->id, task->comm, task->pid);
+
+		src_idx = get_cpuset_cgrp_idx(cset->mg_src_cgrp->id);
+		dst_idx = get_cpuset_cgrp_idx(cset->mg_dst_cgrp->id);
+
+		if (src_idx == -1 || dst_idx == -1) {
+			pr_err("%s: src_cg = %s, id = %d, dst_cg = %s, id = %d, task = %s, pid=%d",
+				__func__, cg_src, cset->mg_src_cgrp->id, cg_dst, cset->mg_dst_cgrp->id, task->comm, task->pid);
+		}
+
+	} else {
+		if (cset->mg_src_cgrp == NULL)
+			pr_err("%s: mg_src_cgrp is NULL", __func__);
+		else {
+			cgroup_name(cset->mg_src_cgrp, cg_src, MAX_CGROUP_TYPE_NAMELEN);
+			pr_err("%s: mg_src_cgrp is : %s", __func__, cg_src);
+		}
+
+		if (cset->mg_dst_cgrp == NULL)
+			pr_err("%s: mg_dst_cgrp is NULL", __func__);
+		else {
+			cgroup_name(cset->mg_dst_cgrp, cg_dst, MAX_CGROUP_TYPE_NAMELEN);
+			pr_err("%s: mg_dst_cgrp is : %s", __func__, cg_dst);
+		}
+	}
+
+	spin_unlock_irq(&css_set_lock);
+
+	if (src_idx == -1 || dst_idx == -1) {
+		pr_err("%s: cannot calc counter", __func__);
+		rcu_read_unlock();
+		return;
+	}
+
+	if (!(task->flags & PF_EXITING)) {
+		get_task_struct(task);
+		rcu_read_unlock();
+
+		/* MUST FIX: calc the pevent only idx=0 instruction counters */
+		for (i = 0; i < 1/*UID_PERF_EVENTS*/; ++i) {
+			val = 0;
+
+			if (task->uid_pevents[i]) {
+				u64 tmp = 0;
+				/* settlement prev cgroup */
+				val = perf_event_read_value(task->uid_pevents[i], &enabled, &running);
+				task->uid_group[src_idx] += (val - task->uid_group_prev_counts[src_idx]);
+				tmp = task->uid_group_prev_counts[src_idx];
+				task->uid_group_prev_counts[src_idx] = 0;
+
+				/* setup dst cgroup prev counters */
+				task->uid_group_prev_counts[dst_idx] = val;
+				if (dbg_enable)
+					pr_err("%s: pid=%d comm=%s val=%llu uid_group[%d] = %llu uid_group_prev_counts[%d] = %llu uid_group_prev_counts[%d] = %llu",
+						__func__, task->pid, task->comm, val,
+						src_idx, task->uid_group[src_idx],
+						src_idx, tmp,
+						dst_idx, task->uid_group_prev_counts[dst_idx]);
+
+			}
+		}
+
+		rcu_read_lock();
+		put_task_struct(task);
+	}
+	rcu_read_unlock();
+}
+
+int cpuset_get_cgrp_idx(struct task_struct *task)
+{
+	int cgrp_id = -1, idx = -1;
+	struct css_set *cset;
+
+	if (!get_uid_perf_enable())
+		return idx;
+
+	rcu_read_lock();
+	spin_lock_irq(&css_set_lock);
+
+	cset = task_css_set(task);
+	if (cset->subsys[cpuset_cgrp_id] && cset->subsys[cpuset_cgrp_id]->cgroup)
+		cgrp_id = cset->subsys[cpuset_cgrp_id]->cgroup->id;
+	else
+		pr_err("%s: cannot get cgrp id", __func__);
+
+	spin_unlock_irq(&css_set_lock);
+	rcu_read_unlock();
+
+	if (cgrp_id > 0)
+		idx = get_cpuset_cgrp_idx(cgrp_id);
+
+	if (idx < 0)
+		if (dbg_enable)
+			pr_err("%s: cset->subsys[cpuset_cgrp_id]->cgroup->id = %d, array idx = %d", __func__, cgrp_id, idx);
+
+	return idx;
+
+}
+
+int cpuset_get_cgrp_idx_locked(struct task_struct *task)
+{
+	int cgrp_id = -1, idx = -1;
+	struct css_set *cset;
+
+	//if (!get_uid_perf_enable())
+	//	return idx;
+
+	spin_lock_irq(&css_set_lock);
+
+	cset = task_css_set(task);
+	if (cset->subsys[cpuset_cgrp_id] && cset->subsys[cpuset_cgrp_id]->cgroup)
+		cgrp_id = cset->subsys[cpuset_cgrp_id]->cgroup->id;
+	else
+		pr_err("%s: cannot get cgrp id", __func__);
+
+	spin_unlock_irq(&css_set_lock);
+
+	if (cgrp_id > 0)
+		idx = get_cpuset_cgrp_idx(cgrp_id);
+
+	if (idx < 0)
+		if (dbg_enable)
+			pr_err("%s: cset->subsys->cgroup->id = %d, array idx = %d", __func__, cgrp_id, idx);
+
+	return idx;
+
+}
+#endif
+
 static struct cpuset *cpuset_attach_old_cs;
 
 /* Called by cgroups to determine if a cpuset is usable; cpuset_mutex held */
@@ -2137,6 +2482,9 @@ static int cpuset_can_attach(struct cgroup_taskset *tset)
 		ret = task_can_attach(task, cs->cpus_allowed);
 		if (ret)
 			goto out_unlock;
+#ifdef CONFIG_OPLUS_FEATURE_UID_PERF
+		cpuset_calc_counter(task);
+#endif
 		ret = security_task_setscheduler(task);
 		if (ret)
 			goto out_unlock;
@@ -2156,11 +2504,15 @@ out_unlock:
 static void cpuset_cancel_attach(struct cgroup_taskset *tset)
 {
 	struct cgroup_subsys_state *css;
+	struct cpuset *cs;
 
 	cgroup_taskset_first(tset, &css);
+	cs = css_cs(css);
 
 	percpu_down_write(&cpuset_rwsem);
-	css_cs(css)->attach_in_progress--;
+	cs->attach_in_progress--;
+	if (!cs->attach_in_progress)
+		wake_up(&cpuset_attach_wq);
 	percpu_up_write(&cpuset_rwsem);
 }
 
@@ -2184,6 +2536,7 @@ static void cpuset_attach(struct cgroup_taskset *tset)
 	cgroup_taskset_first(tset, &css);
 	cs = css_cs(css);
 
+	lockdep_assert_cpus_held();	/* see cgroup_attach_lock() */
 	percpu_down_write(&cpuset_rwsem);
 
 	/* prepare for attach */
@@ -2199,7 +2552,7 @@ static void cpuset_attach(struct cgroup_taskset *tset)
 		 * can_attach beforehand should guarantee that this doesn't
 		 * fail.  TODO: have a better way to handle failure here
 		 */
-		WARN_ON_ONCE(set_cpus_allowed_ptr(task, cpus_attach));
+		WARN_ON_ONCE(update_cpus_allowed(cs, task, cpus_attach));
 
 		cpuset_change_task_nodemask(task, &cpuset_attach_nodemask_to);
 		cpuset_update_task_spread_flag(cs, task);
@@ -2423,7 +2776,7 @@ static int cpuset_common_seq_show(struct seq_file *sf, void *v)
 
 	switch (type) {
 	case FILE_CPULIST:
-		seq_printf(sf, "%*pbl\n", cpumask_pr_args(cs->cpus_allowed));
+		seq_printf(sf, "%*pbl\n", cpumask_pr_args(cs->cpus_requested));
 		break;
 	case FILE_MEMLIST:
 		seq_printf(sf, "%*pbl\n", nodemask_pr_args(&cs->mems_allowed));
@@ -2792,6 +3145,7 @@ static int cpuset_css_online(struct cgroup_subsys_state *css)
 	cs->mems_allowed = parent->mems_allowed;
 	cs->effective_mems = parent->mems_allowed;
 	cpumask_copy(cs->cpus_allowed, parent->cpus_allowed);
+	cpumask_copy(cs->cpus_requested, parent->cpus_requested);
 	cpumask_copy(cs->effective_cpus, parent->cpus_allowed);
 	spin_unlock_irq(&callback_lock);
 out_unlock:
@@ -2908,8 +3262,10 @@ int __init cpuset_init(void)
 	BUG_ON(!alloc_cpumask_var(&top_cpuset.cpus_allowed, GFP_KERNEL));
 	BUG_ON(!alloc_cpumask_var(&top_cpuset.effective_cpus, GFP_KERNEL));
 	BUG_ON(!zalloc_cpumask_var(&top_cpuset.subparts_cpus, GFP_KERNEL));
+	BUG_ON(!alloc_cpumask_var(&top_cpuset.cpus_requested, GFP_KERNEL));
 
 	cpumask_setall(top_cpuset.cpus_allowed);
+	cpumask_setall(top_cpuset.cpus_requested);
 	nodes_setall(top_cpuset.mems_allowed);
 	cpumask_setall(top_cpuset.effective_cpus);
 	nodes_setall(top_cpuset.effective_mems);
@@ -2919,6 +3275,18 @@ int __init cpuset_init(void)
 	top_cpuset.relax_domain_level = -1;
 
 	BUG_ON(!alloc_cpumask_var(&cpus_attach, GFP_KERNEL));
+
+#ifdef CONFIG_OPLUS_FEATURE_UID_PERF
+	cpu_parent = proc_mkdir("cpuset_info", NULL);
+	if (!cpu_parent) {
+		pr_err("%s: failed to create cpuset_info proc entry\n",  __func__);
+		remove_proc_subtree("cpuset_info", NULL);
+		goto end;
+        }
+	proc_create_data("show_hash", 0444, cpu_parent, &hashdump_fops, NULL);
+	proc_create_data("dbg_enable", 0644, cpu_parent, &dbg_fops, NULL);
+end:
+#endif
 
 	return 0;
 }
@@ -3267,8 +3635,11 @@ static struct notifier_block cpuset_track_online_nodes_nb = {
  */
 void __init cpuset_init_smp(void)
 {
-	cpumask_copy(top_cpuset.cpus_allowed, cpu_active_mask);
-	top_cpuset.mems_allowed = node_states[N_MEMORY];
+	/*
+	 * cpus_allowd/mems_allowed set to v2 values in the initial
+	 * cpuset_bind() call will be reset to v1 values in another
+	 * cpuset_bind() call when v1 cpuset is mounted.
+	 */
 	top_cpuset.old_mems_allowed = top_cpuset.mems_allowed;
 
 	cpumask_copy(top_cpuset.effective_cpus, cpu_active_mask);

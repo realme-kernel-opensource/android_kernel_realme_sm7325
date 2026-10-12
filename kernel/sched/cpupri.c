@@ -23,6 +23,10 @@
  *  yields the worst case search is fairly contrived.
  */
 #include "sched.h"
+#include <trace/hooks/sched.h>
+#ifdef CONFIG_OPLUS_FEATURE_IM
+#include <linux/im/im.h>
+#endif
 
 /* Convert between a 140 based task->prio, and our 102 based cpupri */
 static int convert_prio(int prio)
@@ -41,8 +45,44 @@ static int convert_prio(int prio)
 	return cpupri;
 }
 
+#ifdef CONFIG_SCHED_WALT
+/**
+ * drop_nopreempt_cpus - remove a cpu from the mask if it is likely
+ *			 non-preemptible
+ * @lowest_mask: mask with selected CPUs (non-NULL)
+ */
+static void
+drop_nopreempt_cpus(struct cpumask *lowest_mask)
+{
+	unsigned int cpu = cpumask_first(lowest_mask);
+
+	while (cpu < nr_cpu_ids) {
+		/* unlocked access */
+		struct task_struct *task = READ_ONCE(cpu_rq(cpu)->curr);
+
+		if (task_may_not_preempt(task, cpu))
+			cpumask_clear_cpu(cpu, lowest_mask);
+
+		cpu = cpumask_next(cpu, lowest_mask);
+	}
+}
+#endif /* CONFIG_SCHED_WALT */
+
+#if defined(OPLUS_FEATURE_SCHED_ASSIST) && defined(CONFIG_OPLUS_FEATURE_SCHED_ASSIST)
+#include <linux/sched_assist/sched_assist_common.h>
+extern void drop_ux_task_cpus(struct task_struct *p, struct cpumask *lowest_mask);
+extern void kick_min_cpu_from_mask(struct cpumask *lowest_mask);
+extern bool sf_task_misfit(struct task_struct *p);
+#endif /* defined(OPLUS_FEATURE_SCHED_ASSIST) && defined(CONFIG_OPLUS_FEATURE_SCHED_ASSIST) */
+
+#ifndef CONFIG_SCHED_WALT
 static inline int __cpupri_find(struct cpupri *cp, struct task_struct *p,
 				struct cpumask *lowest_mask, int idx)
+#else
+static inline int __cpupri_find(struct cpupri *cp, struct task_struct *p,
+				struct cpumask *lowest_mask, int idx,
+				bool drop_nopreempts)
+#endif
 {
 	struct cpupri_vec *vec  = &cp->pri_to_cpu[idx];
 	int skip = 0;
@@ -79,6 +119,13 @@ static inline int __cpupri_find(struct cpupri *cp, struct task_struct *p,
 	if (lowest_mask) {
 		cpumask_and(lowest_mask, p->cpus_ptr, vec->mask);
 
+#ifdef CONFIG_SCHED_WALT
+		if (drop_nopreempts)
+			drop_nopreempt_cpus(lowest_mask);
+
+		cpumask_andnot(lowest_mask, lowest_mask,
+			       cpu_isolated_mask);
+#endif
 		/*
 		 * We have to ensure that we have at least one bit
 		 * still set in the array, since the map could have
@@ -123,16 +170,46 @@ int cpupri_find_fitness(struct cpupri *cp, struct task_struct *p,
 {
 	int task_pri = convert_prio(p->prio);
 	int idx, cpu;
+	bool drop_vendor = true;
+
+#ifdef CONFIG_SCHED_WALT
+	bool drop_nopreempts = task_pri <= MAX_RT_PRIO;
+#endif
+
+#if defined(OPLUS_FEATURE_SCHED_ASSIST) && defined(CONFIG_OPLUS_FEATURE_SCHED_ASSIST)
+	bool drop_uxtasks = sysctl_sched_assist_enabled;
+#endif /* defined(OPLUS_FEATURE_SCHED_ASSIST) && defined(CONFIG_OPLUS_FEATURE_SCHED_ASSIST) */
 
 	BUG_ON(task_pri >= CPUPRI_NR_PRIORITIES);
 
+#ifdef CONFIG_SCHED_WALT
+retry:
+#endif
+retry_vendor:
 	for (idx = 0; idx < task_pri; idx++) {
 
+#ifndef CONFIG_SCHED_WALT
 		if (!__cpupri_find(cp, p, lowest_mask, idx))
+#else
+		if (!__cpupri_find(cp, p, lowest_mask, idx, drop_nopreempts))
 			continue;
+#endif
+		if (drop_vendor)
+			trace_android_rvh_cpupri_find_fitness(p, lowest_mask);
 
 		if (!lowest_mask || !fitness_fn)
 			return 1;
+
+#if defined(OPLUS_FEATURE_SCHED_ASSIST) && defined(CONFIG_OPLUS_FEATURE_SCHED_ASSIST)
+#ifdef CONFIG_OPLUS_FEATURE_IM
+		if (drop_uxtasks && !im_hwc(p) && !im_hwbinder(p))
+#else
+		if (drop_uxtasks)
+#endif
+			drop_ux_task_cpus(p, lowest_mask);
+		if (drop_uxtasks && sf_task_misfit(p))
+			kick_min_cpu_from_mask(lowest_mask);
+#endif /* defined(OPLUS_FEATURE_SCHED_ASSIST) && defined(CONFIG_OPLUS_FEATURE_SCHED_ASSIST) */
 
 		/* Ensure the capacity of the CPUs fit the task */
 		for_each_cpu(cpu, lowest_mask) {
@@ -149,6 +226,28 @@ int cpupri_find_fitness(struct cpupri *cp, struct task_struct *p,
 
 		return 1;
 	}
+
+#ifdef CONFIG_SCHED_WALT
+	/*
+	 * If we can't find any non-preemptible cpu's, retry so we can
+	 * find the lowest priority target and avoid priority inversion.
+	 */
+	if (drop_nopreempts) {
+		drop_nopreempts = false;
+		goto retry;
+	}
+#endif
+
+	if (drop_vendor) {
+		drop_vendor = false;
+		goto retry_vendor;
+	}
+#if defined(OPLUS_FEATURE_SCHED_ASSIST) && defined(CONFIG_OPLUS_FEATURE_SCHED_ASSIST)
+	if (drop_uxtasks) {
+		drop_uxtasks = false;
+		goto retry;
+	}
+#endif /* defined(OPLUS_FEATURE_SCHED_ASSIST) && defined(CONFIG_OPLUS_FEATURE_SCHED_ASSIST) */
 
 	/*
 	 * If we failed to find a fitting lowest_mask, kick off a new search
@@ -289,4 +388,15 @@ void cpupri_cleanup(struct cpupri *cp)
 	kfree(cp->cpu_to_pri);
 	for (i = 0; i < CPUPRI_NR_PRIORITIES; i++)
 		free_cpumask_var(cp->pri_to_cpu[i].mask);
+}
+
+/*
+ * cpupri_check_rt - check if CPU has a RT task
+ * should be called from rcu-sched read section.
+ */
+bool cpupri_check_rt(void)
+{
+	int cpu = raw_smp_processor_id();
+
+	return cpu_rq(cpu)->rd->cpupri.cpu_to_pri[cpu] > CPUPRI_NORMAL;
 }

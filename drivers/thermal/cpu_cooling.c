@@ -332,7 +332,7 @@ static int cpufreq_set_cur_state(struct thermal_cooling_device *cdev,
 
 	ret = freq_qos_update_request(&cpufreq_cdev->qos_req,
 			cpufreq_cdev->freq_table[state].frequency);
-	if (ret > 0)
+	if (ret >= 0)
 		cpufreq_cdev->cpufreq_state = state;
 
 	return ret;
@@ -589,7 +589,7 @@ __cpufreq_cooling_register(struct device_node *np,
 		cdev = ERR_PTR(ret);
 		goto free_table;
 	}
-	cpufreq_cdev->id = ret;
+	cpufreq_cdev->id = policy->cpu;
 
 	snprintf(dev_name, sizeof(dev_name), "thermal-cpufreq-%d",
 		 cpufreq_cdev->id);

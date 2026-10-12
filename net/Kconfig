@@ -202,7 +202,6 @@ config BRIDGE_NETFILTER
 source "net/netfilter/Kconfig"
 source "net/ipv4/netfilter/Kconfig"
 source "net/ipv6/netfilter/Kconfig"
-source "net/decnet/netfilter/Kconfig"
 source "net/bridge/netfilter/Kconfig"
 
 endif
@@ -219,7 +218,6 @@ source "net/802/Kconfig"
 source "net/bridge/Kconfig"
 source "net/dsa/Kconfig"
 source "net/8021q/Kconfig"
-source "net/decnet/Kconfig"
 source "net/llc/Kconfig"
 source "drivers/net/appletalk/Kconfig"
 source "net/x25/Kconfig"
@@ -393,6 +391,7 @@ source "net/ceph/Kconfig"
 source "net/nfc/Kconfig"
 source "net/psample/Kconfig"
 source "net/ife/Kconfig"
+source "net/neuron/Kconfig"
 
 config LWTUNNEL
 	bool "Network light weight tunnels"
@@ -450,6 +449,28 @@ config FAILOVER
 	  migration of VMs with direct attached VFs by failing over to the
 	  paravirtual datapath when the VF is unplugged.
 
+#Shortcut-forwarding-engine
+config ENABLE_SFE
+	bool "Enable Shortcut-forwarding-engine"
+	depends on QGKI
+	help
+	  ENABLE_SFE enables software acceleration on the target.
+          The change supports Shortcut forwarding engine feature.
+	  Includes following changes, Add support to packet threshold events.
+	  Changes to support Shortcut Forward Engine.
+	  Add bridge API to access the bridge slave port.
+
+#Generic-Software-Bridge
+config ENABLE_GSB
+        bool "Enable generic-software-bridge"
+        depends on QGKI
+        help
+          ENABLE_GSB enables software acceleration on the target via gsb.
+          The change supports generic software bridge.
+          Helps to include gsb hook on the kernel.
+          Fulfills requirement of GSB network stack receive.
+          Change is supposed to go only on targets supporting gsb.
+
 endif   # if NET
 
 # Used by archs to tell that they support BPF JIT compiler plus which flavour.
@@ -463,3 +484,24 @@ config HAVE_CBPF_JIT
 # Extended BPF JIT (eBPF)
 config HAVE_EBPF_JIT
 	bool
+
+source "net/oplus_connectivity_routerboost/Kconfig"
+
+source "net/oplus_connectivity_sla/Kconfig"
+
+source "net/oplus_connectivity_luckymoney/Kconfig"
+
+config OPLUS_BUG_STABILITY
+	bool "add for disable tcp random timestamp,some networks limit tcp syn before login"
+
+source "net/oplus_connectivity_dhcp/Kconfig"
+
+source "net/oplus_score/Kconfig"
+
+source "net/oplus_apps_monitor/Kconfig"
+
+source "net/oplus_nwpower/Kconfig"
+
+source "net/oplus_wificapcenter/Kconfig"
+
+source "net/oplus_modules/Kconfig"
